@@ -6,70 +6,139 @@ import random
 import argparse
 import logging
 import sys
+import asyncio
+from asyncio import Lock
+
+
+console_lock = threading.Lock()
+
+def cli_thread(server):
+    try:
+        while True:
+            with console_lock:
+                command = input("Enter command (reconnect/stop): ").strip().lower()
+            if command == "reconnect":
+                with console_lock:
+                    new_host = input("Enter new host: ")
+                    new_port = int(input("Enter new port: "))
+                asyncio.run_coroutine_threadsafe(
+                    server.send_reconnect(new_host, new_port),
+                    server.loop
+                )
+                with console_lock:
+                    print(f"Reconnect command sent to {new_host}:{new_port}", flush=True)
+            elif command == "stop":
+                server.stop()
+                break
+            else:
+                with console_lock:
+                    print("Unknown command", flush=True)
+    except KeyboardInterrupt:
+        with console_lock:
+            logging.info("Received keyboard interrupt, stopping server")
+        server.stop()
 
 class MockStratumV1Server:
     def __init__(self, host='0.0.0.0', port=3333, difficulty=1, work_interval=30):
         self.host = host
         self.port = port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((self.host, self.port))
-        self.clients = []
-        self.job_id = 0
         self.difficulty = difficulty
         self.extranonce1 = '00000000'
         self.extranonce2_size = 4
         self.work_interval = work_interval
         self.running = True
+        self.clients = []
+        self.clients_lock = Lock()
+        self.job_id = 0
+
+        # key -> writer, values {'difficulty': diff}
+        self.client_info = {}
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
 
     def start(self):
-        self.sock.listen(5)
-        logging.info(f"Mock Stratum V1 server listening on {self.host}:{self.port}")
-        
-        # Start the work update thread
-        work_thread = threading.Thread(target=self.periodic_work_update)
-        work_thread.start()
+        self.loop.run_until_complete(self.main_async())
 
-        while self.running:
-            try:
-                client, addr = self.sock.accept()
-                logging.info(f"New connection from {addr}")
-                client_thread = threading.Thread(target=self.handle_client, args=(client,))
-                client_thread.start()
-            except Exception as e:
-                logging.error(f"Error accepting connection: {e}")
+    async def main_async(self):
+        # Start the periodic work update coroutine as a task
+        asyncio.create_task(self.periodic_work_update())
+        # Start the server
+        await self.start_server()
 
-    def handle_client(self, client):
-        self.clients.append(client)
-        while self.running:
-            try:
-                data = client.recv(1024).decode('utf-8')
+    async def start_server(self):
+        server = await asyncio.start_server(
+            self.handle_client, self.host, self.port
+        )
+        addr = server.sockets[0].getsockname()
+        logging.info(f"Serving on {addr}")
+        async with server:
+            await server.serve_forever()
+
+    async def handle_client(self, reader, writer):
+        addr = writer.get_extra_info('peername')
+        async with self.clients_lock:
+            self.clients.append(writer)
+        logging.info(f"Client connected: {addr}")
+
+        try:
+            while self.running:
+                data = await reader.readline()
                 if not data:
                     break
-                messages = data.split('\n')
-                for message in messages:
-                    if message:
-                        self.handle_message(client, json.loads(message))
-            except json.JSONDecodeError:
-                logging.warning(f"Received invalid JSON: {data}")
-            except Exception as e:
-                logging.error(f"Error handling client: {e}")
-                break
-        client.close()
-        self.clients.remove(client)
+                message = json.loads(data.decode())
+                await self.handle_message(writer, message)
+        except Exception as e:
+            logging.error(f"Error handling client {addr}: {e}")
+        finally:
+            async with self.clients_lock:
+                # need to remove the client
+                if writer in self.clients:
+                    self.clients.remove(writer)
 
-    def handle_message(self, client, message):
+                # cleanup the client info
+                if writer in self.client_info:
+                    del self.client_info[writer]
+            
+            writer.close()
+            await writer.wait_closed()
+            logging.info(f"Client disconnected: {addr}")
+
+    async def handle_message(self, writer, message):
         method = message.get('method')
         if method == 'mining.subscribe':
-            self.handle_subscribe(client, message)
+            await self.handle_subscribe(writer, message)
         elif method == 'mining.authorize':
-            self.handle_authorize(client, message)
+            await self.handle_authorize(writer, message)
         elif method == 'mining.submit':
-            self.handle_submit(client, message)
+            await self.handle_submit(writer, message)
+        elif method == 'mining.configure':
+            await self.handle_configure(writer, message)
+        elif method == 'mining.suggest_difficulty':
+            await self.handle_suggest_difficulty(writer, message)
         else:
-            logging.warning(f"Received unknown method: {method}")
+            logging.warning(f"Unknown method: {method}")
 
-    def handle_subscribe(self, client, message):
+    async def handle_suggest_difficulty(self, writer, message):
+        params = message.get('params', [])
+        if params:
+            suggested_difficulty = params[0]
+            # Update the client's difficulty setting
+            client_info = self.client_info.get(writer, {})
+            client_info['difficulty'] = suggested_difficulty
+            self.client_info[writer] = client_info
+            logging.info(f"Client suggested difficulty: {suggested_difficulty}")
+            await self.send_difficulty(writer, suggested_difficulty)
+        else:
+            logging.warning("No difficulty provided in 'mining.suggest_difficulty'")
+        # Respond with 'null' result as per JSON-RPC 2.0 specification
+        response = {
+            "id": message['id'],
+            "result": None,
+            "error": None
+        }
+        await self.send_message(writer, response)
+
+    async def handle_subscribe(self, writer, message):
         response = {
             "id": message['id'],
             "result": [
@@ -82,82 +151,110 @@ class MockStratumV1Server:
             ],
             "error": None
         }
-        self.send_message(client, response)
+        await self.send_message(writer, response)
 
-    def handle_authorize(self, client, message):
+    async def handle_authorize(self, writer, message):
         response = {
             "id": message['id'],
             "result": True,
             "error": None
         }
-        self.send_message(client, response)
-        self.send_difficulty(client)
-        self.send_work(client)
+        await self.send_message(writer, response)
+        await self.send_difficulty(writer)
+        await self.send_work(writer)
 
-    def handle_submit(self, client, message):
-        # In a real implementation, you'd validate the submitted work here
+    async def handle_submit(self, writer, message):
+        share_valid = random.choice([True, False])
         response = {
             "id": message['id'],
-            "result": True,
+            "result": share_valid,
+            "error": None if share_valid else [21, "Invalid share", None]
+        }
+        await self.send_message(writer, response)
+        if share_valid:
+            logging.info(f"Accepted share from client")
+        else:
+            logging.warning(f"Rejected share from client")
+
+    async def handle_configure(self, writer, message):
+        response = {
+            "id": message['id'],
+            "result": {"version-rolling": True},
             "error": None
         }
-        self.send_message(client, response)
-        logging.info(f"Received work submission: {message}")
+        await self.send_message(writer, response)
 
-    def send_message(self, client, message):
+    async def send_message(self, writer, message):
         try:
-            client.send(json.dumps(message).encode() + b'\n')
+            writer.write(json.dumps(message).encode() + b'\n')
+            await writer.drain()
         except Exception as e:
             logging.error(f"Error sending message to client: {e}")
-            self.clients.remove(client)
+            async with self.clients_lock:
+                if writer in self.clients:
+                    self.clients.remove(writer)
 
-    def send_difficulty(self, client):
+    async def send_difficulty(self, writer, difficulty=None):
+        if difficulty is None:
+            difficulty = self.difficulty
         message = {
             "id": None,
             "method": "mining.set_difficulty",
-            "params": [self.difficulty]
+            "params": [difficulty]
         }
-        self.send_message(client, message)
+        await self.send_message(writer, message)
 
-    def send_work(self, client):
+
+    async def send_work(self, writer):
         self.job_id += 1
+        ntime = f"{int(time.time()):08x}"
+
+        # todo if we want to use dif in work assignment
+        # client_info = self.client_info.get(writer, {})
+        # difficulty = client_info.get('difficulty', self.difficulty)
+
         message = {
             "id": None,
             "method": "mining.notify",
             "params": [
                 f"{self.job_id:04x}",
                 "0" * 64,  # prev_block_hash
-                "01000000" + "0" * 96,  # coinbase_1
-                "0" * 96,  # coinbase_2
-                [],  # merkle_branch
-                "00000002",  # version
-                "1A015F53",  # nbits (difficulty target)
-                f"{int(time.time()):08x}",  # ntime
-                False  # clean_jobs
+                "0" * 128,  # coinbase1
+                "0" * 128,  # coinbase2
+                [],         # merkle_branch
+                "00000002", # version
+                "1a1dc0de", # nbits
+                ntime,
+                False       # clean_jobs
             ]
         }
-        self.send_message(client, message)
+        await self.send_message(writer, message)
 
-    def send_reconnect(self, new_host, new_port, wait_time=10):
+    async def periodic_work_update(self):
+        while self.running:
+            await asyncio.sleep(self.work_interval)
+            async with self.clients_lock:
+                clients_copy = list(self.clients)
+            for writer in clients_copy:
+                await self.send_work(writer)
+            logging.info(f"Sent work update to {len(clients_copy)} clients")
+
+    async def send_reconnect(self, new_host, new_port, wait_time=10):
         message = {
             "id": None,
             "method": "client.reconnect",
             "params": [new_host, new_port, wait_time]
         }
-        for client in self.clients:
-            self.send_message(client, message)
+        async with self.clients_lock:
+            clients_copy = list(self.clients)
+        for writer in clients_copy:
+            await self.send_message(writer, message)
         logging.info(f"Sent reconnect message to all clients: {new_host}:{new_port}")
-
-    def periodic_work_update(self):
-        while self.running:
-            time.sleep(self.work_interval)
-            for client in self.clients:
-                self.send_work(client)
-            logging.info(f"Sent work update to {len(self.clients)} clients")
 
     def stop(self):
         self.running = False
-        self.sock.close()
+        # Stop the event loop
+        self.loop.stop()
 
 def main():
     parser = argparse.ArgumentParser(description="Mock Stratum V1 Server")
@@ -168,28 +265,25 @@ def main():
     parser.add_argument("--log-level", default="INFO", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], help="Set the logging level")
     args = parser.parse_args()
 
-    logging.basicConfig(level=args.log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+    # Adjust logging configuration
+    logging.basicConfig(
+        level=args.log_level,
+        format='%(asctime)s - %(levelname)s - [%(threadName)s] %(message)s',
+        datefmt='%H:%M:%S'
+    )
 
     server = MockStratumV1Server(args.host, args.port, args.difficulty, args.work_interval)
-    server_thread = threading.Thread(target=server.start)
+
+    # Start the server thread
+    server_thread = threading.Thread(target=server.start, name='ServerThread', daemon=True)
     server_thread.start()
 
-    try:
-        while True:
-            command = input("Enter command (reconnect/stop): ").strip().lower()
-            if command == "reconnect":
-                new_host = input("Enter new host: ")
-                new_port = int(input("Enter new port: "))
-                server.send_reconnect(new_host, new_port)
-            elif command == "stop":
-                server.stop()
-                break
-            else:
-                print("Unknown command")
-    except KeyboardInterrupt:
-        logging.info("Received keyboard interrupt, stopping server")
-        server.stop()
+    # Start the CLI thread
+    cli_thread_instance = threading.Thread(target=cli_thread, args=(server,), name='CLIThread')
+    cli_thread_instance.start()
 
+    # Wait for the CLI thread to finish
+    cli_thread_instance.join()
     server_thread.join()
 
 if __name__ == "__main__":
